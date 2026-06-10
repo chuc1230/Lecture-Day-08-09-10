@@ -112,5 +112,37 @@ def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[Expectati
         )
     )
 
+    # E7: core_docs_present (halt) - Đảm bảo tất cả 5 nguồn dữ liệu nghiệp vụ quan trọng đều có mặt
+    core_docs = {"policy_refund_v4", "sla_p1_2026", "it_helpdesk_faq", "hr_leave_policy", "access_control_sop"}
+    present_docs = {r.get("doc_id") for r in cleaned_rows if r.get("doc_id")}
+    missing_core = core_docs - present_docs
+    ok7 = len(missing_core) == 0
+    results.append(
+        ExpectationResult(
+            "core_docs_present",
+            ok7,
+            "halt",
+            f"missing_core_docs={sorted(list(missing_core))}",
+        )
+    )
+
+    # E8: no_duplicate_chunk_text (warn) - Cảnh báo nếu có dữ liệu bị lặp nội dung chunk_text
+    seen_texts = set()
+    dup_count = 0
+    for r in cleaned_rows:
+        txt = (r.get("chunk_text") or "").strip().lower()
+        if txt in seen_texts:
+            dup_count += 1
+        seen_texts.add(txt)
+    ok8 = dup_count == 0
+    results.append(
+        ExpectationResult(
+            "no_duplicate_chunk_text",
+            ok8,
+            "warn",
+            f"duplicate_chunk_count={dup_count}",
+        )
+    )
+
     halt = any(not r.passed and r.severity == "halt" for r in results)
     return results, halt

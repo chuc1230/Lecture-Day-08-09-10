@@ -1,30 +1,51 @@
-"""
-Cleaning rules — raw export → cleaned rows + quarantine.
-
-Baseline gồm các failure mode mở rộng (allowlist doc_id, parse ngày, HR stale version).
-Sinh viên thêm ≥3 rule mới: mỗi rule phải ghi `metric_impact` (xem README — chống trivial).
-"""
-
 from __future__ import annotations
 
 import csv
 import hashlib
 import re
+import yaml
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-# Khớp export hợp lệ trong lab (mở rộng khi nhóm thêm doc mới — phải đồng bộ contract).
-ALLOWED_DOC_IDS = frozenset(
-    {
-        "policy_refund_v4",
-        "sla_p1_2026",
-        "it_helpdesk_faq",
-        "hr_leave_policy",
-    }
-)
+ROOT = Path(__file__).resolve().parent.parent
+
+def load_data_contract() -> dict:
+    contract_path = ROOT / "contracts" / "data_contract.yaml"
+    if contract_path.exists():
+        with contract_path.open("r", encoding="utf-8") as f:
+            try:
+                return yaml.safe_load(f) or {}
+            except Exception:
+                pass
+    return {}
+
+_CONTRACT = load_data_contract()
+
+# Load ALLOWED_DOC_IDS and cutoff dates dynamically from data contract (Distinction Requirement)
+_contract_doc_ids = _CONTRACT.get("allowed_doc_ids", [])
+if _contract_doc_ids:
+    ALLOWED_DOC_IDS = frozenset(_contract_doc_ids)
+else:
+    ALLOWED_DOC_IDS = frozenset(
+        {
+            "policy_refund_v4",
+            "sla_p1_2026",
+            "it_helpdesk_faq",
+            "hr_leave_policy",
+            "security_policy",
+            "data_privacy_guideline",
+            "access_control_sop",
+        }
+    )
+
+_HR_LEAVE_MIN_DATE = _CONTRACT.get("policy_versioning", {}).get("hr_leave_min_effective_date", "2026-01-01")
 
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DMY_SLASH = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
+
+# Khai báo Regex cho Rule 1 (loại bỏ thẻ meta hệ thống hoặc ID trong ngoặc)
+_SOURCE_TAG_PAT = re.compile(r"<[^>]+>|\[[^\]]+\]", re.IGNORECASE)
+
 
 
 def _norm_text(s: str) -> str:
@@ -37,10 +58,6 @@ def _stable_chunk_id(doc_id: str, chunk_text: str, seq: int) -> str:
 
 
 def _normalize_effective_date(raw: str) -> Tuple[str, str]:
-    """
-    Trả về (iso_date, error_reason).
-    iso_date rỗng nếu không parse được.
-    """
     s = (raw or "").strip()
     if not s:
         return "", "empty_effective_date"
@@ -67,17 +84,7 @@ def clean_rows(
     *,
     apply_refund_window_fix: bool = True,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Trả về (cleaned, quarantine).
-
-    Baseline (mở rộng theo narrative Day 10):
-    1) Quarantine: doc_id không thuộc allowlist (export lạ / catalog sai).
-    2) Chuẩn hoá effective_date sang YYYY-MM-DD; quarantine nếu không parse được.
-    3) Quarantine: chunk hr_leave_policy có effective_date < 2026-01-01 (bản HR cũ / conflict version).
-    4) Quarantine: chunk_text rỗng hoặc effective_date rỗng sau chuẩn hoá.
-    5) Loại trùng nội dung chunk_text (giữ bản đầu).
-    6) Fix stale refund: policy_refund_v4 chứa '14 ngày làm việc' → 7 ngày.
-    """
+    
     quarantine: List[Dict[str, Any]] = []
     seen_text: set[str] = set()
     cleaned: List[Dict[str, Any]] = []
@@ -101,7 +108,7 @@ def clean_rows(
             quarantine.append({**raw, "reason": eff_err, "effective_date_raw": eff_raw})
             continue
 
-        if doc_id == "hr_leave_policy" and eff_norm < "2026-01-01":
+        if doc_id == "hr_leave_policy" and eff_norm < _HR_LEAVE_MIN_DATE:
             quarantine.append(
                 {
                     **raw,
@@ -111,17 +118,40 @@ def clean_rows(
             )
             continue
 
-        if not text:
+        # 2. FIX DỮ LIỆU STALE (NỘI DUNG CŨ): 
+        # Loại bỏ hẳn dòng chứa quy định phép năm cũ dù ngày export hợp lệ
+        if doc_id == "hr_leave_policy" and ("10 ngày phép năm" in text or "10 ngày làm việc phép năm" in text):
+            quarantine.append({**raw, "reason": "stale_hr_policy_content"})
+            continue
+
+        # 3. THÊM ≥3 RULE MỚI ĐỂ LÀM SẠCH TEXT
+        fixed_text = text
+
+        # Rule mới 1: Loại bỏ thẻ meta hệ thống 
+        # metric_impact: Tránh cho mô hình RAG lấy các ID nội bộ không mang ý nghĩa nghiệp vụ làm nhiễu kết quả.
+        fixed_text = _SOURCE_TAG_PAT.sub("", fixed_text)
+
+        # Rule mới 2: Loại bỏ tiền tố gây nhiễu
+        # metric_impact: Tối ưu vector ngữ nghĩa (embedding) bằng cách xóa bỏ từ khóa lỗi "!!!", "Nội dung không rõ ràng:" ở đầu chuỗi.
+        fixed_text = fixed_text.replace("Nội dung không rõ ràng:", "").lstrip("! ").strip()
+
+        # Rule mới 3: Sửa lỗi đánh máy lặp từ
+        # metric_impact: Giảm chi phí token thừa và làm mượt ngữ nghĩa văn bản.
+        if "làm việc làm việc" in fixed_text:
+            fixed_text = fixed_text.replace("làm việc làm việc làm việc", "làm việc").replace("làm việc làm việc", "làm việc")
+
+        # Rule mới 4: Bổ sung ngữ cảnh bị mất cho các ticket P1/P2/P3/P4
+        # metric_impact: Bổ sung từ khóa "Ticket" vào trước "Escalation P1/P2" để mô hình embedding thu hẹp khoảng cách vector với các câu hỏi về ticket P1/P2, cải thiện độ chính xác retrieval.
+        if fixed_text.startswith("Escalation P1:"):
+            fixed_text = fixed_text.replace("Escalation P1:", "Ticket P1: Escalation:")
+        elif fixed_text.startswith("Escalation P2:"):
+            fixed_text = fixed_text.replace("Escalation P2:", "Ticket P2: Escalation:")
+
+        if not fixed_text:
             quarantine.append({**raw, "reason": "missing_chunk_text"})
             continue
 
-        key = _norm_text(text)
-        if key in seen_text:
-            quarantine.append({**raw, "reason": "duplicate_chunk_text"})
-            continue
-        seen_text.add(key)
-
-        fixed_text = text
+        # Baseline: Fix stale refund
         if apply_refund_window_fix and doc_id == "policy_refund_v4":
             if "14 ngày làm việc" in fixed_text:
                 fixed_text = fixed_text.replace(
@@ -129,6 +159,12 @@ def clean_rows(
                     "7 ngày làm việc",
                 )
                 fixed_text += " [cleaned: stale_refund_window]"
+
+        key = _norm_text(fixed_text)
+        if key in seen_text:
+            quarantine.append({**raw, "reason": "duplicate_chunk_text"})
+            continue
+        seen_text.add(key)
 
         seq += 1
         cleaned.append(
