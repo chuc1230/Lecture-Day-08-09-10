@@ -80,10 +80,32 @@ python eval_retrieval.py --out artifacts/eval/after_inject_bad.csv
 - **Chuẩn hóa & Đồng bộ:** Pipeline đóng vai trò cầu nối, tự động sửa đổi chính sách hoàn tiền 14 ngày thành 7 ngày, lọc bỏ phép năm cũ dưới 2026, loại bỏ thẻ rác, và khôi phục từ khóa ngữ cảnh `"Ticket P1/P2: "` để đảm bảo dữ liệu khi được nhúng (embedded) vào ChromaDB luôn sạch và có độ liên quan ngữ nghĩa cực cao.
 
 ### 2. Cách thức hoạt động của Pipeline
-- **Ingest:** Đọc CSV dữ liệu thô, khởi tạo `run_id` duy nhất và ghi nhận số lượng dòng đầu vào.
-- **Clean (Transform):** Áp dụng các quy tắc làm sạch dữ liệu. Để đạt yêu cầu **Distinction**, danh sách `allowed_doc_ids` và ngày phép năm tối thiểu `_HR_LEAVE_MIN_DATE` được tải động từ file cấu hình `data_contract.yaml` thay vì hard-code trong code.
-- **Validate (Quality Gate):** Thực thi 8 quy tắc kiểm định (E1 đến E8). Nếu phát hiện lỗi nghiêm trọng (Halt severity) như ngày hiệu lực sai định dạng hoặc thiếu tài liệu cốt lõi, pipeline lập tức dừng lại, ngăn ngừa dữ liệu lỗi rò rỉ vào hệ thống phục vụ Agent.
-- **Embed (Load):** Chuyển đổi văn bản sạch thành vector embeddings qua mô hình `all-MiniLM-L6-v2`, thực hiện **Snapshot Sync** (upsert vector mới theo `chunk_id` và tự động prune/xóa các vector ID cũ không còn nằm trong tập dữ liệu sạch hiện tại để tránh "mồi cũ" gây nhiễu).
+- **Ingest:** Pipeline bắt đầu bằng việc đọc file CSV thô đầu vào qua hàm `load_raw_csv` trong `transform/cleaning_rules.py`. Tại đây, một mã định danh phiên chạy duy nhất (`run_id`) được khởi tạo dưới dạng UTC timestamp, và số lượng dòng thô đầu vào được ghi nhận (`raw_records`).
+- **Clean (Transform):** Áp dụng các quy tắc làm sạch dữ liệu qua hàm `clean_rows` trong `transform/cleaning_rules.py`. Để đạt yêu cầu **Distinction**, danh sách `allowed_doc_ids` và ngày phép năm tối thiểu `_HR_LEAVE_MIN_DATE` được tải động từ file cấu hình `data_contract.yaml` thay vì hard-code trong code. Các bản ghi lỗi sẽ bị đẩy vào quarantine CSV, các bản ghi sạch sẽ được lưu lại để nạp cơ sở dữ liệu.
+- **Validate (Quality Gate):** Thực thi 8 quy tắc kiểm định (E1 đến E8) trong `quality/expectations.py`. Nếu phát hiện lỗi nghiêm trọng (Halt severity) như ngày hiệu lực sai định dạng hoặc thiếu tài liệu cốt lõi, pipeline lập tức dừng lại, ngăn ngừa dữ liệu lỗi rò rỉ vào hệ thống phục vụ Agent.
+- **Embed (Load):** Chuyển đổi văn bản sạch thành vector embeddings qua mô hình `all-MiniLM-L6-v2` và tải lên ChromaDB. Pipeline thực hiện **Snapshot Sync** (upsert vector mới theo `chunk_id` và tự động prune/xóa các vector ID cũ không còn nằm trong tập dữ liệu sạch hiện tại để tránh "mồi cũ" gây nhiễu).
+
+### 3. Chi tiết logic và cách thức xử lý trong Code (Implementation Details)
+Dưới đây là mô tả chi tiết logic mã nguồn được triển khai để giải quyết các yêu cầu của bài lab:
+
+1. **Đọc cấu hình động từ Hợp đồng dữ liệu (YAML Config Parser):**
+   - *Logic:* Thay vì hard-code cấu hình allowlist và ngày hiệu lực phép năm trong mã nguồn Python, chúng tôi load động tệp cấu hình `contracts/data_contract.yaml`.
+   - *Cách code xử lý:* Sử dụng hàm `yaml.safe_load()` trong `transform/cleaning_rules.py` để đọc tệp YAML. Từ đó gán động cho tập hợp `ALLOWED_DOC_IDS` và biến mốc ngày hiệu lực nhân sự tối thiểu `_HR_LEAVE_MIN_DATE`. Điều này cho phép mở rộng cho phép các tài liệu mới như `access_control_sop` chỉ bằng cách sửa file cấu hình YAML.
+2. **Giải quyết xung đột phiên bản nhân sự (HR Leave Version Conflict):**
+   - *Logic:* Cách ly mọi dòng chính sách cũ (10 ngày phép năm của bản HR 2025) và chỉ cho phép giữ lại bản chính sách 2026 (12 ngày phép năm) có ngày hiệu lực từ `2026-01-01` trở đi.
+   - *Cách code xử lý:* Trong hàm `clean_rows` của `transform/cleaning_rules.py`, kiểm tra nếu `doc_id == "hr_leave_policy"` và ngày hiệu lực nhỏ hơn `_HR_LEAVE_MIN_DATE` (2026-01-01) thì đẩy vào quarantine với lý do `stale_hr_policy_effective_date`. Đồng thời, nếu trong văn bản chứa từ khóa phép năm cũ `"10 ngày phép năm"` hoặc `"10 ngày làm việc phép năm"`, dòng đó sẽ bị cách ly với lý do `stale_hr_policy_content`.
+3. **Chuẩn hóa thời hạn hoàn tiền (Refund Window Adjustment):**
+   - *Logic:* Sửa chữa tại chỗ (in-place repair) các đoạn văn bản thô ghi sai thời gian hoàn tiền là 14 ngày làm việc về đúng quy định hiện hành của bản v4 là 7 ngày làm việc.
+   - *Cách code xử lý:* Trong `transform/cleaning_rules.py`, nếu cờ `apply_refund_window_fix` được bật và dòng dữ liệu thuộc `policy_refund_v4` có chứa cụm từ `"14 ngày làm việc"`, chúng tôi sử dụng phương thức `.replace()` để đổi thành `"7 ngày làm việc"` và đính kèm nhãn vết ` [cleaned: stale_refund_window]` để tiện theo dõi nguồn gốc thay đổi.
+4. **Làm giàu ngữ cảnh tìm kiếm (RAG Context Enrichment):**
+   - *Logic:* Khôi phục các từ khóa nghiệp vụ bị mất (như từ `"Ticket"`) trong các đoạn văn bản về xử lý sự cố để cải thiện khoảng cách vector, giúp mô hình nhúng (embedding model) tìm kiếm chính xác các dòng quy định này.
+   - *Cách code xử lý:* Trong `transform/cleaning_rules.py`, chúng tôi thêm quy tắc làm sạch mới (Rule 4): nếu văn bản bắt đầu bằng `"Escalation P1:"` hoặc `"Escalation P2:"`, hệ thống sẽ tự động đổi tương ứng thành `"Ticket P1: Escalation:"` hoặc `"Ticket P2: Escalation:"`. Nhờ vậy, câu hỏi RAG về ticket P1/P2 sẽ tìm chính xác đến các dòng quy định này (Rank 1 trong kết quả retrieval thay vì bị trôi xuống Rank 9).
+5. **Kiểm soát chất lượng bằng Expectation Suite:**
+   - *Logic:* Đảm bảo dữ liệu sạch không chứa lỗi hoàn tiền 14 ngày, định dạng ngày chuẩn ISO, không chứa phép năm 10 ngày cũ, không trùng lặp và đầy đủ các tài liệu nghiệp vụ chính.
+   - *Cách code xử lý:* Trong `quality/expectations.py`, ngoài các luật có sẵn, chúng tôi bổ sung **E7 (`core_docs_present`)** thực hiện tính hiệu của 2 tập hợp nhằm đảm bảo tất cả 5 tài liệu chính đều có ít nhất 1 chunk sạch trong ChromaDB (Halt severity) và **E8 (`no_duplicate_chunk_text`)** kiểm tra không cho phép trùng lặp văn bản sạch (Warn severity).
+6. **Snapshot Sync trong ChromaDB (Idempotency):**
+   - *Logic:* Rerun pipeline nhiều lần không gây duplicate dữ liệu, và xóa bỏ hoàn toàn các vector lỗi cũ (hoặc vector stale của run trước) để tránh agent tìm thấy dữ liệu cũ.
+   - *Cách code xử lý:* Trong `etl_pipeline.py` (hàm `cmd_embed_internal`), chúng tôi lấy danh sách tất cả các ID hiện có trong ChromaDB (`col.get()`), tính toán hiệu tập hợp giữa các ID cũ và các ID sạch mới (`prev_ids - set(ids)`), và chạy lệnh `col.delete(ids=drop)` để xóa bỏ (prune) hoàn toàn các vector cũ, sau đó thực hiện `col.upsert()` để cập nhật dữ liệu sạch mới.
 
 ---
 
